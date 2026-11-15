@@ -1,0 +1,5 @@
+numpy>=1.23
+opencv-python>=4.6
+scipy>=1.9
+svgwrite>=1.4
+pytest>=7.0

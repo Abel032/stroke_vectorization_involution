@@ -1,0 +1,32 @@
+{
+  "size": [
+    512,
+    512
+  ],
+  "skeleton_segments": 4,
+  "active_segments": 4,
+  "closed_segments": 0,
+  "semantic_strokes": 2,
+  "junctions": 1,
+  "bridges": 2,
+  "removed_spikes": 0,
+  "removed_connectors": 0,
+  "removed_ids": {},
+  "config": {
+    "threshold": -1,
+    "invert": false,
+    "smooth": 0.05,
+    "sample_step": 0.5,
+    "spike_cos": 0.99,
+    "connector_boundary_cos": 0.95,
+    "collinear_cos": 0.99,
+    "ray_limit": 90.0,
+    "boundary_corner_deg": 43.0,
+    "max_trim": 22.0,
+    "max_bridge": 75.0,
+    "min_component": 4,
+    "svg_width": 1.0,
+    "svg_mode": "centerline",
+    "enable_completeness": true
+  }
+}

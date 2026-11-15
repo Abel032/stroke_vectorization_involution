@@ -1,0 +1,4 @@
+-r requirements.txt
+torch>=2.1
+scikit-image>=0.20
+tqdm>=4.65
