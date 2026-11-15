@@ -1,3 +1,17 @@
+# CPU 密集交点优化（2026-11-16 增量版）
+
+**本版本基于用户上传的工程直接修改，并用提供的 `examples/B02_transparent.png` 回归。** 主要新增：透明 BGRA Alpha 正确读取、交汇节点的图路径约束聚类、过滤交点内微小自环、可靠二度交点折叠、歧义节点降级及按段长限制裁切。所有 GNN 接口仍保持 CPU 纯计算，不自动绘图或写文件。
+
+- 详细差异、参数与 B02 对比：[docs/B02_密集交点优化_CPU.md](docs/B02_密集交点优化_CPU.md)
+- B02 基准：`OPENBLAS_NUM_THREADS=1 python bench_b02_cpu.py --repeats 3`
+- 测试：`python -m pytest -q`（36 项通过）
+- 含 Alpha 的输入：`cv2.imread(path, cv2.IMREAD_UNCHANGED)`，CLI 同样保留 Alpha。
+- `vectorize(image, Config(), output_mode='skeleton'|'segments'|'full')` 均不做可视化或输出文件。只有显式 `export_result` / CLI 才写文件。
+
+> 旧版 PDF `算法实现与使用手册.pdf` 为原算法流程手册；此轮的修改与 B02 实测以新文档 `docs/B02_密集交点优化_CPU.md` 和补充 PDF 为准。
+
+---
+
 # CPU 线稿骨架与 Segment 平均宽度（Python）
 
 基于 Zhang et al. (2022), *Vectorizing Line Drawings of Arbitrary Thickness via Boundary-based Topology Reconstruction* (DOI: 10.1111/cgf.14485) 的**研究性工程复现**。此次版本针对 CPU 上被 GNN 调用的场景优化，**每个 Segment 只有一个平均宽度值**，且所有公共被调接口都不会生成图片、SVG、PDF、图表或写文件。

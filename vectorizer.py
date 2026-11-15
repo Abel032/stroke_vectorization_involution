@@ -8,7 +8,7 @@ Coordinates are (x, y), origin at image top left. Binary mask True=ink.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
 import argparse
@@ -45,6 +45,24 @@ class Config:
     enable_completeness: bool = True
     diagonal_policy: str = 'topology_safe'  # redundant_only / legacy / all_8
     junction_merge_distance: float = 3.1
+    # Only fuse nearby junction pixel clusters connected on the skeleton
+    # through <=2 intermediate valence-two pixels. Euclidean-only fusing
+    # joins unrelated crossings in tightly drawn art.
+    junction_merge_mode: str = 'geodesic'  # geodesic / euclidean (legacy)
+    junction_merge_max_hops: int = 3
+    junction_blob_max_span: float = 5.0
+    # A 2-5px "loop" returning to the SAME junction is often only a
+    # pixel-graph shortcut around a multi-pixel intersection, not a real ring.
+    junction_microcycle_max_length: float = 7.0
+    junction_microcycle_max_radius: float = 3.0
+    # Do not keep residual degree-two junctions caused by segment removal.
+    collapse_degree2: bool = True
+    demote_unresolved_pseudojunctions: bool = True
+    degree2_outward_cos: float = 0.35
+    # Cap cutting at each junction as a fraction of the local segment length.
+    trim_fraction_limit: float = 0.24
+    # RGBA transparent art has alpha ink; handle directly on CPU.
+    alpha_threshold: int = 127
     pair_opposite_cos: float = .72
     boundary_query_k: int = 48
     boundary_normal_dot_limit: float = .34
@@ -180,24 +198,30 @@ def tangents(p: np.ndarray, look: int = 5, closed: bool = False) -> np.ndarray:
 
 
 def preprocess(image: np.ndarray, cfg: Config) -> np.ndarray:
-    if image.ndim == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    """BGR/gray or BGRA with transparency -> bool ink mask (no visualization)."""
+    arr = np.asarray(image)
+    if arr.ndim == 3 and arr.shape[-1] == 4 and np.any(arr[..., 3] != 255):
+        # Transparent PNG: RGB can be (0,0,0) even in transparent background.
+        bi = (arr[..., 3] > cfg.alpha_threshold).astype(np.uint8)
     else:
-        gray = image.copy()
-    gray = np.uint8(gray)
-    if cfg.threshold < 0:
-        _, bi = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    else:
-        bi = np.uint8(gray < cfg.threshold) * 255
+        if arr.ndim == 3:
+            gray = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY if arr.shape[-1] == 4
+                                    else cv2.COLOR_BGR2GRAY)
+        else:
+            gray = arr
+        gray = np.asarray(gray, np.uint8)
+        if cfg.threshold < 0:
+            _, bi = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        else:
+            bi = (gray < cfg.threshold).astype(np.uint8)
     if cfg.invert:
-        bi = 255 - bi
-    # Discard tiny isolated dust components while retaining fine real strokes.
-    num, labels, sizes, _ = cv2.connectedComponentsWithStats(bi, 8)
-    if cfg.min_component > 1:
-        for i in range(1, num):
-            if sizes[i, cv2.CC_STAT_AREA] < cfg.min_component:
-                bi[labels == i] = 0
-    return bi > 0
+        bi = 1 - bi
+    if cfg.min_component > 1 and np.any(bi):
+        n, labels, sizes, _ = cv2.connectedComponentsWithStats(bi, 8)
+        keep = sizes[:, cv2.CC_STAT_AREA] >= cfg.min_component
+        keep[0] = False
+        return keep[labels]
+    return bi.astype(bool)
 
 
 def _zhang_suen(binary: np.ndarray) -> np.ndarray:
@@ -305,21 +329,63 @@ def skeleton_graph(img: np.ndarray, cfg: Config) -> tuple[list[Segment], dict]:
                     blob.add(q)
                     stack.append(q)
         junction_blobs.append(blob)
-    # A single X-junction can have two degree>=3 blobs connected by one
-    # or two degree-2 pixels; merge those near-center artifacts.
-    changed=True
-    while changed:
-        changed=False
-        for i in range(len(junction_blobs)):
-            if changed:
-                break
-            for j in range(i+1,len(junction_blobs)):
-                ci=np.mean(np.asarray(list(junction_blobs[i]),float),axis=0)
-                cj=np.mean(np.asarray(list(junction_blobs[j]),float),axis=0)
-                if np.linalg.norm(ci-cj)<=cfg.junction_merge_distance:
-                    junction_blobs[i].update(junction_blobs.pop(j))
-                    changed=True
-                    break
+    # A physical X-junction may contain multiple small valence>=3 clusters.
+    # The legacy Euclidean-only merge silently fuses distinct nearby crossings.
+    # Here the default requires a *short walk on the actual skeleton graph*,
+    # with all intermediate pixels of degree 2. Merge-connectors become node
+    # pixels, not spurious tiny self-loop segments.
+    if cfg.junction_merge_mode not in ('geodesic','euclidean'):
+        raise ValueError('junction_merge_mode must be geodesic or euclidean')
+    if len(junction_blobs) > 1 and cfg.junction_merge_distance > 0:
+        centers = np.asarray([np.mean(list(b),axis=0) for b in junction_blobs])
+        near_pairs = sorted(cKDTree(centers).query_pairs(cfg.junction_merge_distance))
+        parent=list(range(len(junction_blobs)))
+        clusters=[set(x) for x in junction_blobs]
+        merged_paths=[]
+        original_members={p:i for i,blob in enumerate(junction_blobs) for p in blob}
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def short_link(i,j):
+            # Walk no more than max_hops edges and never traverse another
+            # high-valence node. All intermediate pixels must be valence 2.
+            target=junction_blobs[j]
+            work=deque((p,(p,)) for p in sorted(junction_blobs[i]))
+            seen=set(junction_blobs[i])
+            while work:
+                p,path=work.popleft()
+                if len(path)-1>=cfg.junction_merge_max_hops:
+                    continue
+                for q in adj[p]:
+                    if q in target:
+                        return list(path[1:])  # only the interior pixels
+                    if q in seen or degree[q]!=2 or q in original_members:
+                        continue
+                    seen.add(q)
+                    work.append((q,path+(q,)))
+            return None
+
+        for i,j in near_pairs:
+            a,b=find(i),find(j)
+            if a==b:continue
+            link=None
+            if cfg.junction_merge_mode=='geodesic':
+                link=short_link(i,j)
+                if link is None:continue
+            combined=clusters[a] | clusters[b]
+            if link:combined.update(link)
+            bounds=np.ptp(np.asarray(list(combined),dtype=float),axis=0)
+            if cfg.junction_merge_mode=='geodesic' and np.max(bounds)>cfg.junction_blob_max_span:
+                continue
+            parent[b]=a
+            clusters[a]=combined
+            clusters[b]=set()
+            if link:merged_paths.append(link)
+        junction_blobs=[v for v in clusters if v]
     nodes = {}              # nodeid -> xy
     belonging = {}          # pixel -> nodeid
     is_junction = {}
@@ -345,6 +411,13 @@ def skeleton_graph(img: np.ndarray, cfg: Config) -> tuple[list[Segment], dict]:
         if len(path) < 2:
             return
         pix = np.asarray(path, float)
+        if closed and src >= 0 and src == dest and len(pix)>1:
+            # Never treat a 2x2 cycle inside a fat junction as an
+            # independent closed stroke. Legitimate small loops not attached
+            # to a junction (src == -1) are kept unconditionally.
+            if (poly_length(pix) <= cfg.junction_microcycle_max_length and
+                np.max(np.linalg.norm(pix-nodes[src],axis=1)) <= cfg.junction_microcycle_max_radius):
+                return
         # Replace the very ends of junction blobs by the mean junction location.
         if src >= 0:
             pix[0] = nodes[src]
@@ -683,7 +756,8 @@ def trim_to_reliable(s: Segment, side: int, edt: np.ndarray, cfg: Config) -> int
         return 0 if side==0 else n-1
     end = p[0] if side==0 else p[-1]
     x,y=np.clip(np.round(end).astype(int),[0,0],[edt.shape[1]-1,edt.shape[0]-1])
-    maxtrim = min(cfg.max_trim,max(3.,2.0*float(edt[y,x])+3.))
+    maxtrim = min(cfg.max_trim, max(3., 2.0*float(edt[y,x])+3.),
+                  max(0.75, cfg.trim_fraction_limit * poly_length(p)))
     if side==0:
         order=range(n)
     else:
@@ -752,6 +826,113 @@ def _quadratic_extension(s: Segment, ep: Endpoint, target: np.ndarray, cfg: Conf
     curve=extrap+correction
     curve[0],curve[-1]=ep.position,target
     return curve
+
+
+def collapse_degree2_junctions(segments: list[Segment], graph: dict,
+                               cfg: Config) -> int:
+    """Splice a pair of active segments at a residual 2-way pseudo-junction.
+
+    Classification can delete a false spike, leaving a valence-3 source node
+    with two physical arms. It is no longer a keypoint. Splice the *existing*
+    sampled polylines rather than creating two extrapolated bridges. Only a
+    sufficiently opposed pair is fused; ambiguous touching strokes are kept.
+    No new boundary queries and no raster or visualization work.
+    """
+    if not cfg.collapse_degree2:
+        return 0
+    count=0
+    while True:
+        incid=defaultdict(list)
+        for s in segments:
+            if not s.active or s.closed:
+                continue
+            incid[s.start].append(s)
+            incid[s.end].append(s)
+        changed=False
+        for nid in sorted(graph['nodes']):
+            if not graph['junction'].get(nid,False):
+                continue
+            touching=incid[nid]
+            if len(touching)!=2 or touching[0].sid==touching[1].sid:
+                continue
+            a,b=touching
+            def outward(seg):
+                pts=seg.dense
+                if len(pts)<2:return np.zeros(2)
+                k=min(len(pts)-1, max(2,int(np.ceil(5.0/max(cfg.sample_step,0.1)))))
+                if seg.start==nid:return unit(pts[k]-pts[0])
+                return unit(pts[-1-k]-pts[-1])
+            cos=float(np.dot(outward(a),outward(b)))
+            if cos>cfg.degree2_outward_cos:
+                continue
+            # Orient a toward the junction, b away from it. Reverse sampled
+            # boundary sides when reversing the centerline orientation.
+            pa=a.dense if a.end==nid else a.dense[::-1]
+            pb=b.dense if b.start==nid else b.dense[::-1]
+            if len(pa)<2 or len(pb)<2:continue
+            if poly_length(pa)<1.0 or poly_length(pb)<1.0:continue
+            a_outer=a.start if a.end==nid else a.end
+            b_outer=b.end if b.start==nid else b.start
+            if a_outer==nid or b_outer==nid:continue
+            # Duplicate knot removal; no angle smoothing across a real corner.
+            pts=np.vstack((pa,pb[1:]))
+            if poly_length(pts)<1e-5:continue
+            def orient_info(seg,reverse):
+                vals=seg.consistency[::-1] if reverse else seg.consistency
+                left=seg.right[::-1] if reverse else seg.left
+                right=seg.left[::-1] if reverse else seg.right
+                return vals,list(left),list(right)
+            ca,la,ra=orient_info(a,a.end!=nid)
+            cb,lb,rb=orient_info(b,b.start!=nid)
+            # IDs remain stable: the lower-ID segment is the surviving unit.
+            keep,drop=(a,b) if a.sid < b.sid else (b,a)
+            keep.start,keep.end=a_outer,b_outer
+            keep.closed=(a_outer==b_outer)
+            keep.points=pts
+            keep.dense=pts
+            keep.raw=pts.copy()
+            keep.tangent=tangents(pts,closed=keep.closed)
+            keep.consistency=np.r_[ca,cb[1:]] if len(ca)==len(pa) and len(cb)==len(pb) else np.ones(len(pts))
+            keep.left=la+lb[1:] if len(la)==len(pa) and len(lb)==len(pb) else [None]*len(pts)
+            keep.right=ra+rb[1:] if len(ra)==len(pa) and len(rb)==len(pb) else [None]*len(pts)
+            drop.active=False
+            drop.reason='degree2_collapsed'
+            graph['nodes'].pop(nid,None)
+            graph['junction'].pop(nid,None)
+            graph.setdefault('collapsed_junctions',[]).append(int(nid))
+            count+=1
+            changed=True
+            break
+        if not changed:break
+    return count
+
+
+def demote_pseudojunctions(segments: list[Segment], graph: dict,
+                           cfg: Config) -> int:
+    """Mark valence<3 residuals as endpoints/ambiguous touches, not junctions.
+
+    A residual degree-two node with acute outward arms is *not* blindly
+    joined: this is often two nearby lines that the original thinning
+    accidentally squeezed together. Remove its false junction status but
+    preserve two separate geometric segment terminals and their original IDs.
+    """
+    if not cfg.demote_unresolved_pseudojunctions:
+        return 0
+    incid=defaultdict(list)
+    for s in segments:
+        if not s.active or s.closed:continue
+        incid[s.start].append(s.sid)
+        incid[s.end].append(s.sid)
+    demoted=[]
+    for nid in sorted(graph['nodes']):
+        if not graph['junction'].get(nid,False):continue
+        attached=sorted(set(incid[nid]))
+        if len(attached) >=3:continue
+        graph['junction'][nid]=False
+        demoted.append({'id':int(nid), 'remaining_valence':len(attached),
+                        'segment_ids':attached})
+    graph['demoted_pseudojunctions']=demoted
+    return len(demoted)
 
 
 def reconstruct(segments: list[Segment], graph: dict, bound: Boundaries,
@@ -839,12 +1020,15 @@ def reconstruct(segments: list[Segment], graph: dict, bound: Boundaries,
 
 
 def rasterize(strokes: list[np.ndarray], shape: tuple[int,int], thickness: int = 1) -> np.ndarray:
+    # For downstream GNN, the refined skeleton MUST be a discrete 1px mask.
+    # LINE_AA creates low-alpha neighbor pixels that become True after >0 and
+    # can merge otherwise disjoint Region partitions. Use LINE_8 instead.
     image=np.zeros(shape,dtype=np.uint8)
     for p in strokes:
         if len(p)<2:
             continue
         pts=np.round(p).astype(np.int32).reshape((-1,1,2))
-        cv2.polylines(image,[pts],False,255,thickness,cv2.LINE_AA)
+        cv2.polylines(image,[pts],False,255,thickness,cv2.LINE_8)
     return image
 
 
@@ -906,6 +1090,8 @@ def vectorize(image: np.ndarray, cfg: Config | None = None, *,
     graph['segments']=segments
     edt=ndimage.distance_transform_edt(binary)
     removed=classify_segments(segments,graph,boundary_model,binary,edt,cfg)
+    n_collapsed=collapse_degree2_junctions(segments,graph,cfg)
+    n_demoted=demote_pseudojunctions(segments,graph,cfg)
     strokes,nbridges,pieces,bridge_lines,bridge_records=reconstruct(
         segments,graph,boundary_model,edt,cfg)
     out=rasterize(strokes,binary.shape)>0
@@ -915,7 +1101,9 @@ def vectorize(image: np.ndarray, cfg: Config | None = None, *,
                       removed['removed_spikes'],removed['removed_connectors'],
                       sum(graph['junction'].values()),nbridges,
                       {'size':[int(binary.shape[1]),int(binary.shape[0])],
-                       'active_segments':sum(s.active for s in segments),**removed},
+                       'active_segments':sum(s.active for s in segments),
+                       'collapsed_degree2_junctions':n_collapsed,
+                       'demoted_pseudojunctions':n_demoted,**removed},
                       source_graph=graph)
 
     boundary_mask=np.zeros_like(raw) if output_mode=='full' else np.zeros((0,0),bool)
@@ -946,7 +1134,10 @@ def vectorize(image: np.ndarray, cfg: Config | None = None, *,
     part_segment_ids += [None]*len(bridge_lines)
     meta={'size':[int(binary.shape[1]),int(binary.shape[0])],
           'skeleton_segments':len(segments),'active_segments':len(active),
-          'closed_segments':sum(x.closed for x in segments),
+          'collapsed_degree2_junctions':n_collapsed,
+          'demoted_pseudojunctions':n_demoted,
+          'closed_segments':sum(x.active and x.closed for x in segments),
+          'collapsed_segment_ids':[int(x.sid) for x in segments if x.reason=='degree2_collapsed'],
           'semantic_strokes':len(semantic_strokes),
           'junctions':sum(graph['junction'].values()),
           'bridges':nbridges,
@@ -955,7 +1146,8 @@ def vectorize(image: np.ndarray, cfg: Config | None = None, *,
                     'definition':'one scalar mean_width_px per active G segment',
                     'segment_count':len(widths)},
           **removed,
-          'removed_ids':{str(s.sid):s.reason for s in segments if not s.active},
+          'removed_ids':{str(s.sid):s.reason for s in segments
+                         if not s.active and s.reason!='degree2_collapsed'},
           'config':vars(cfg)}
     stored_strokes=strokes if output_mode=='full' else []
     return Result(binary,raw,boundary_mask,out,stored_strokes,len(segments),
@@ -1001,6 +1193,17 @@ def cli(argv=None):
     ap.add_argument('--max-trim',type=float,default=22.)
     ap.add_argument('--boundary-corner-deg',type=float,default=43.)
     ap.add_argument('--junction-merge-distance',type=float,default=3.1)
+    ap.add_argument('--junction-merge-mode',choices=['geodesic','euclidean'],default='geodesic')
+    ap.add_argument('--junction-merge-max-hops',type=int,default=3)
+    ap.add_argument('--junction-blob-max-span',type=float,default=5.)
+    ap.add_argument('--junction-microcycle-max-length',type=float,default=7.)
+    ap.add_argument('--junction-microcycle-max-radius',type=float,default=3.)
+    ap.add_argument('--no-degree2-collapse',action='store_true')
+    ap.add_argument('--degree2-outward-cos',type=float,default=.35)
+    ap.add_argument('--no-demote-pseudojunctions',action='store_true')
+    ap.add_argument('--trim-fraction-limit',type=float,default=.24)
+    ap.add_argument('--alpha-threshold',type=int,default=127)
+
     ap.add_argument('--boundary-query-k',type=int,default=48)
     ap.add_argument('--boundary-normal-dot-limit',type=float,default=.34)
     ap.add_argument('--pair-opposite-cos',type=float,default=.72)
@@ -1009,7 +1212,7 @@ def cli(argv=None):
     ap.add_argument('--width-trim-fraction',type=float,default=.12)
     ap.add_argument('--width-max-samples',type=int,default=96)
     args=ap.parse_args(argv)
-    image=cv2.imread(args.input,cv2.IMREAD_COLOR)
+    image=cv2.imread(args.input,cv2.IMREAD_UNCHANGED)
     if image is None:
         ap.error(f'Cannot read image: {args.input}')
     cfg=Config(threshold=args.threshold,invert=args.invert,svg_mode=args.svg_mode,
@@ -1020,6 +1223,16 @@ def cli(argv=None):
                collinear_cos=args.collinear_cos,connector_boundary_cos=args.connector_boundary_cos,
                max_trim=args.max_trim,boundary_corner_deg=args.boundary_corner_deg,
                junction_merge_distance=args.junction_merge_distance,
+               junction_merge_mode=args.junction_merge_mode,
+               junction_merge_max_hops=args.junction_merge_max_hops,
+               junction_blob_max_span=args.junction_blob_max_span,
+               junction_microcycle_max_length=args.junction_microcycle_max_length,
+               junction_microcycle_max_radius=args.junction_microcycle_max_radius,
+               collapse_degree2=not args.no_degree2_collapse,
+               degree2_outward_cos=args.degree2_outward_cos,
+               demote_unresolved_pseudojunctions=not args.no_demote_pseudojunctions,
+               trim_fraction_limit=args.trim_fraction_limit,
+               alpha_threshold=args.alpha_threshold,
                boundary_query_k=args.boundary_query_k,
                boundary_normal_dot_limit=args.boundary_normal_dot_limit,
                pair_opposite_cos=args.pair_opposite_cos,diagonal_policy=args.diagonal_policy,

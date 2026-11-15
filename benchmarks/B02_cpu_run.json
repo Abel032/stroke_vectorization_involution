@@ -1,0 +1,56 @@
+{
+  "shape": [
+    730,
+    2048,
+    4
+  ],
+  "runs": {
+    "skeleton": {
+      "median_seconds": 1.5851,
+      "sample_seconds": [
+        1.7314,
+        1.5787,
+        1.5851
+      ],
+      "initial_segments": 522,
+      "active_segments": 414,
+      "junctions": 162,
+      "bridges": 363,
+      "collapsed_degree2": 42,
+      "demoted_pseudo": 13
+    },
+    "segments": {
+      "median_seconds": 1.6316,
+      "sample_seconds": [
+        1.6316,
+        1.5911,
+        1.7045
+      ],
+      "initial_segments": 522,
+      "active_segments": 414,
+      "junctions": 162,
+      "bridges": 363,
+      "collapsed_degree2": 42,
+      "demoted_pseudo": 13,
+      "segment_width_count": 414,
+      "median_width_px": 1.5
+    },
+    "full": {
+      "median_seconds": 1.8136,
+      "sample_seconds": [
+        1.7564,
+        1.8136,
+        1.9387
+      ],
+      "initial_segments": 522,
+      "active_segments": 414,
+      "junctions": 162,
+      "bridges": 363,
+      "collapsed_degree2": 42,
+      "demoted_pseudo": 13,
+      "stroke_count": 273,
+      "median_stroke_length_px": 16.8,
+      "deg2_junctions": 0
+    }
+  }
+}
