@@ -3,6 +3,7 @@
 **本版本基于用户上传的工程直接修改，并用提供的 `examples/B02_transparent.png` 回归。** 主要新增：透明 BGRA Alpha 正确读取、交汇节点的图路径约束聚类、过滤交点内微小自环、可靠二度交点折叠、歧义节点降级及按段长限制裁切。所有 GNN 接口仍保持 CPU 纯计算，不自动绘图或写文件。
 
 - 详细差异、参数与 B02 对比：[docs/B02_密集交点优化_CPU.md](docs/B02_密集交点优化_CPU.md)
+- **与论文的逐条差异（含本次对齐项）**：[docs/PAPER_DEVIATIONS.md](docs/PAPER_DEVIATIONS.md)
 - B02 基准：`OPENBLAS_NUM_THREADS=1 python bench_b02_cpu.py --repeats 3`
 - 测试：`python -m pytest -q`（36 项通过）
 - 含 Alpha 的输入：`cv2.imread(path, cv2.IMREAD_UNCHANGED)`，CLI 同样保留 Alpha。

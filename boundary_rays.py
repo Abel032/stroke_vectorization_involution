@@ -8,12 +8,17 @@ def unit_rows(a):
     return a/np.maximum(np.linalg.norm(a,axis=-1,keepdims=True),1e-12)
 
 def cast_exit_rays(binary: np.ndarray, origins: np.ndarray, directions: np.ndarray,
-                   limits: np.ndarray | float, step: float = .5, batch: int = 768):
+                   limits: np.ndarray | float, step: float = .5, batch: int = 768,
+                   img_f32: np.ndarray | None = None):
     """Batch signed rays. Returns (distance, valid) at first ink->background exit.
 
     Uses OpenCV remap across ALL pixels/steps of each batch, never Python per ray.
     Mask boundaries are sampled bilinearly with threshold 0.5 (subpixel approx).
     A ray reaching its safety limit without an exit is invalid, not an EDT width.
+
+    img_f32: precomputed float32 ink image (same content as `binary`). Passing it
+    avoids one full-image float conversion per call - the dominant cost when a
+    caller invokes this once per segment on a multi-megapixel drawing.
     """
     origins = np.asarray(origins, dtype=np.float32).reshape(-1, 2)
     directions = unit_rows(np.asarray(directions, np.float32).reshape(-1, 2)).astype(np.float32)
@@ -22,7 +27,7 @@ def cast_exit_rays(binary: np.ndarray, origins: np.ndarray, directions: np.ndarr
     valid = np.zeros(len(origins), dtype=bool)
     if not len(origins) or not np.any(binary):
         return distance, valid
-    img = np.asarray(binary, dtype=np.float32)
+    img = img_f32 if img_f32 is not None else np.asarray(binary, dtype=np.float32)
     stride = max(.2, float(step))
     for a in range(0, len(origins), batch):
         b = min(len(origins), a+batch)

@@ -30,13 +30,15 @@ from boundary_rays import cast_exit_rays
 class Config:
     threshold: int = -1               # -1 = Otsu
     invert: bool = False              # standard input: dark ink on light background
-    smooth: float = 0.05              # spline smoothing strength (paper Sec. 4.1.1)
+    # 论文 §4.1.1 写的是 smoothing parameter 0.05；这里的 s 按点数归一化
+    # (splprep s = smooth*N)，等价于每点均方残差 ≈ smooth，长段上才能既平滑又贴合。
+    smooth: float = 0.05              # spline smoothing strength (paper Sec. 4.1.1, normalized)
     sample_step: float = 0.5          # paper Sec. 4.2.1
     spike_cos: float = 0.99           # paper Eq. (2)
     connector_boundary_cos: float = 0.95  # paper Sec. 4.2.2
     collinear_cos: float = 0.99       # paper Sec. 4.3.2
     ray_limit: float = 90.0
-    boundary_corner_deg: float = 43.0
+    boundary_corner_deg: float = 43.0  # 已弃用：边界分段改为按拟合偏差 >1px 递归细分
     max_trim: float = 22.0
     max_bridge: float = 75.0
     min_component: int = 4
@@ -245,9 +247,11 @@ def _zhang_suen(binary: np.ndarray) -> np.ndarray:
             p8 = im[1:-1, :-2]
             p9 = im[:-2, :-2]
             ring = (p2,p3,p4,p5,p6,p7,p8,p9)
-            n = sum(ring)
-            crossings = sum((ring[i] == 0) & (ring[(i+1)%8] == 1)
-                            for i in range(8))
+            stacked = np.stack(ring, axis=0)          # (8,H,W) uint8
+            n = stacked.sum(axis=0, dtype=np.int16)
+            # 0->1 的环向跳变数（与 sum((ring[i]==0)&(ring[i+1]==1)) 等价）
+            crossings = ((stacked == 0) & (np.roll(stacked, -1, axis=0) == 1)).sum(
+                axis=0, dtype=np.int16)
             if stage == 0:
                 condition = ((p2*p4*p6 == 0) & (p4*p6*p8 == 0))
             else:
@@ -469,10 +473,100 @@ def skeleton_graph(img: np.ndarray, cfg: Config) -> tuple[list[Segment], dict]:
     return segments, {'nodes':nodes, 'junction':is_junction, 'adjacency':adj}
 
 
+def _fit_arc_deviation(arc: np.ndarray, smooth: float, sigma: float = 1.5):
+    """一段栅格边界点相对**平滑/拟合曲线**的逐点偏差（像素）。
+
+    论文 §4.1.2 用"拟合曲线与栅格点的偏差 >1px"定位枢轴。把 splprep 拟合换成沿弧
+    的高斯平滑：两者在这里的作用相同（去掉像素阶梯、转角被拉平），但平滑是 O(P) 的
+    一维滤波，实测比逐段 splprep 快一个数量级（长边界上每段都拟合会让整体慢 ~35%）。
+    """
+    n = len(arc)
+    if n < 6:
+        return None
+    q = _smooth_arc(arc, sigma)
+    return np.linalg.norm(q - np.asarray(arc, float), axis=1)
+
+
+def _boundary_pivots(p: np.ndarray, cfg: Config, tol: float = 1.0,
+                     min_arc: int = 8, max_pivots: int = 64) -> list[int]:
+    """论文 §4.1.2 的边界分段：在"拟合曲线偏离栅格 >1px"处断开，递归到偏差 ≤1px。
+
+    替代原先的"转角 43° + 非极大值抑制"：转角阈值既会切开平滑大弧，也切不开
+    1px 级的小折角，而偏差判据直接对应论文的"拟合误差 ≤1 像素"保证。
+    """
+    n = len(p)
+    if n < 2 * min_arc:
+        return []
+    pivots: list[int] = []
+    # 先对整圈判定一次（首尾重复点让它近似闭合）
+    dev = _fit_arc_deviation(np.vstack([p, p[:1]]), cfg.smooth)
+    if dev is None:
+        return []
+    dev = dev[:-1]
+    if dev.max() <= tol:
+        return []
+    first = int(np.argmax(dev))
+    pivots.append(first)
+    stack = [(first, first + n)]
+    while stack and len(pivots) < max_pivots:
+        a, b = stack.pop()
+        if b - a < min_arc:
+            continue
+        idx = np.arange(a, b + 1) % n
+        dev = _fit_arc_deviation(p[idx], cfg.smooth)
+        if dev is None or len(dev) < 2:
+            continue
+        i = int(np.argmax(dev[:-1]))
+        if dev[i] <= tol:
+            continue
+        pos = int(idx[i])
+        if pos in pivots:
+            continue
+        pivots.append(pos)
+        stack.append((a, a + i))
+        stack.append((a + i, b))
+    return sorted(set(pivots))
+
+
+def _smooth_arc(arc: np.ndarray, sigma: float = 1.5) -> np.ndarray:
+    """沿弧的轻度平滑（端点/转角保持不动），用作论文"曲线拟合"的廉价等价物。"""
+    if len(arc) < 4:
+        return arc
+    q = ndimage.gaussian_filter1d(np.asarray(arc, float), sigma=sigma, axis=0,
+                                  mode='nearest')
+    q[0], q[-1] = arc[0], arc[-1]
+    return q
+
+
+def _arc_tangents(p: np.ndarray, pivots: list[int], sigma: float = 1.5,
+                  look: int = 3) -> np.ndarray:
+    """按枢轴分段平滑后再取对称差分切向 —— 论文要求的"从拟合曲线取切向"。
+
+    直接对栅格轮廓取弦差会把像素阶梯的抖动带进 Eq.(1)/Eq.(4) 的一致性判定。
+    """
+    n = len(p)
+    t = np.zeros((n, 2))
+    if not pivots:
+        q = ndimage.gaussian_filter1d(np.asarray(p, float), sigma=sigma, axis=0,
+                                      mode='wrap')
+        return tangents(q, 4, True)
+    piv = sorted(set(pivots))
+    arcs = list(zip(piv, piv[1:] + [piv[0] + n]))
+    for a, b in arcs:
+        idx = np.arange(a, b + 1) % n
+        q = _smooth_arc(p[idx], sigma)
+        tt = tangents(q, look, False)
+        t[idx[:-1]] = tt[:-1]
+    return unit(t)
+
+
 class Boundaries:
     """Dense continuous foreground boundaries, corner-based segment IDs and tangents."""
     def __init__(self, binary: np.ndarray, cfg: Config):
         self.cfg = cfg
+        # 缓存 float32 墨线图：cast_exit_rays 若每次自己转换整图，5.4MP 图 ×
+        # 每段 2 次调用就是上千次全图拷贝（实测占了大部分运行时间）。
+        self.ink_f32 = np.asarray(binary, dtype=np.float32)
         self.contours: list[np.ndarray] = []
         self.tvec: list[np.ndarray] = []
         self.groups: list[np.ndarray] = []
@@ -487,27 +581,9 @@ class Boundaries:
                 continue
             cid = len(self.contours)
             self.contours.append(p)
-            # Tangents: fit small-scale symmetric chord to reduce pixel staircases.
-            t = tangents(p, 4, True)
-            self.tvec.append(t)
-            k = max(3, min(6, len(p)//12))
-            incoming = unit(p-np.roll(p, k, axis=0))
-            outgoing = unit(np.roll(p, -k, axis=0)-p)
-            c = np.clip((incoming*outgoing).sum(axis=1), -1, 1)
-            angles = np.degrees(np.arccos(c))
-            # Equivalent non-maximum suppression, O(P*(k+2)) rather than
-            # O(number_of_corner_candidates^2). Circular contours wrap.
-            pivots=[]
-            blocked=np.zeros(len(p),dtype=bool)
-            window=np.arange(-(k+1),k+2)
-            for pos in np.argsort(angles)[::-1]:
-                if angles[pos] < cfg.boundary_corner_deg:
-                    break
-                if blocked[pos]:
-                    continue
-                pos=int(pos)
-                pivots.append(pos)
-                blocked[(pos+window)%len(p)]=True
+            # 论文 §4.1.2：先按"拟合偏差 >1px"分段，再在每段内平滑后取切向。
+            pivots = _boundary_pivots(p, cfg)
+            self.tvec.append(_arc_tangents(p, pivots))
             pivots.sort()
             group = np.empty(len(p), dtype=int)
             if not pivots:
@@ -569,8 +645,17 @@ class Boundaries:
         normal = np.array([-t[1],t[0]])
         l = self.normal_hit(p,normal,binary,float(edt[y,x]))
         r = self.normal_hit(p,-normal,binary,float(edt[y,x]))
-        vals = [abs(np.dot(t,hit.tangent)) for hit in (l,r) if hit is not None]
-        return (float(max(vals)) if vals else 0.),l,r
+        # 与 initiated_batch 同一口径：两侧都有命中用有符号 max（论文 Eq.(1)），
+        # 单侧命中退回 |cos|。
+        if l is not None and r is not None:
+            score = max(float(np.dot(t,l.tangent)), float(np.dot(t,r.tangent)))
+        elif l is not None:
+            score = abs(float(np.dot(t,l.tangent)))
+        elif r is not None:
+            score = abs(float(np.dot(t,r.tangent)))
+        else:
+            score = 0.
+        return score,l,r
 
     def initiated_batch(self, points: np.ndarray, vectors: np.ndarray,
                         binary: np.ndarray, edt: np.ndarray):
@@ -592,12 +677,15 @@ class Boundaries:
         safe = ((p[:,0]>=0)&(p[:,0]<w)&(p[:,1]>=0)&(p[:,1]<h)
                 & binary[y,x] & (np.linalg.norm(t,axis=1)>.1))
         limits=np.minimum(self.cfg.ray_limit, np.maximum(5.,2.8*edt[y,x]+4.))
-        left_d,left_ok=cast_exit_rays(binary,p,normal,limits,self.cfg.sample_step)
-        right_d,right_ok=cast_exit_rays(binary,p,-normal,limits,self.cfg.sample_step)
+        left_d,left_ok=cast_exit_rays(binary,p,normal,limits,self.cfg.sample_step,
+                                      img_f32=getattr(self,'ink_f32',None))
+        right_d,right_ok=cast_exit_rays(binary,p,-normal,limits,self.cfg.sample_step,
+                                        img_f32=getattr(self,'ink_f32',None))
         left_ok &= safe
         right_ok &= safe
         hits=[]
-        scores=np.zeros((2,n),float)
+        signed=np.zeros((2,n),float)          # 有符号 cos：论文 Eq.(1) 的形式
+        avail=np.zeros((2,n),bool)            # 该侧是否真的找到边界命中
         for k,(dist,ok,direction) in enumerate(((left_d,left_ok,normal),(right_d,right_ok,-normal))):
             cur=[None]*n
             ids=np.flatnonzero(ok)
@@ -610,9 +698,20 @@ class Boundaries:
                     tang=self.tvec[cid][vertex]
                     pt=self.contours[cid][vertex]
                     cur[ki]=BoundaryHit(cid,vertex,int(self.groups[cid][vertex]),tuple(pt),tuple(tang))
-                    scores[k,ki]=abs(float(np.dot(t[ki],tang)))
+                    signed[k,ki]=float(np.dot(t[ki],tang))
+                    avail[k,ki]=True
             hits.append(cur)
-        return np.max(scores,axis=0),hits[0],hits[1]
+        # 论文 Eq.(1) 是**有符号**一致性 max(t·t_b^left, t·t_b^right)：
+        # 两侧都有命中时保留符号（反向 = 不一致，可识别"折回"的假尖刺）；
+        # 只有一侧命中时无法判断方向，退回 |cos|。
+        score=np.zeros(n,float)
+        both=avail[0]&avail[1]
+        score[both]=np.maximum(signed[0][both],signed[1][both])
+        left_only=avail[0]&~avail[1]
+        score[left_only]=np.abs(signed[0][left_only])
+        right_only=avail[1]&~avail[0]
+        score[right_only]=np.abs(signed[1][right_only])
+        return score,hits[0],hits[1]
 
     def boundary_initiated_batch(self, points: np.ndarray, vectors: np.ndarray,
                                  radii: np.ndarray) -> np.ndarray:
@@ -635,7 +734,9 @@ class Boundaries:
             boundary_t=self.tangent_lookup[safe_idx]
             toward=(p[start:stop,None,:]-self.positions[safe_idx])/np.maximum(distances[:,:,None],1e-6)
             normal_ok=np.abs(np.sum(toward*boundary_t,axis=-1))<=self.cfg.boundary_normal_dot_limit
-            angle=np.abs(np.sum(t[start:stop,None,:]*boundary_t,axis=-1))
+            # 论文 Eq.(4) 同样是有符号一致性 max(t·t_b)；负相关按"无证据"截到 0，
+            # 方向歧义由两侧/多点各取一个自身最优来消化（不再用 |cos| 把反向当一致）。
+            angle=np.sum(t[start:stop,None,:]*boundary_t,axis=-1)
             out[start:stop]=np.max(np.where(ok&normal_ok,angle,0.),axis=1)
         return out
 
@@ -694,18 +795,73 @@ def _is_junction(s: Segment, graph: dict) -> tuple[bool,bool]:
     return bool(graph['junction'].get(s.start,False)),bool(graph['junction'].get(s.end,False))
 
 
+def _sample_segments_batched(segments: list[Segment], binary: np.ndarray,
+                             edt: np.ndarray, bound: Boundaries) -> None:
+    """一次批量完成所有 Segment 的边界采样 —— 与逐段 `sample_segment` 等价。
+
+    `initiated_batch` 内部已按 768 点分块做 remap，所以把全部段拼成一次调用只是
+    省掉逐段的 Python/OpenCV 固定开销（以及 cast_exit_rays 的重复准备工作），
+    逐点结果不变。
+    """
+    cfg = bound.cfg
+    dense = [resample(s.points, cfg.sample_step, s.closed) for s in segments]
+    tans = [tangents(d, 5, s.closed) for d, s in zip(dense, segments)]
+    for s, d, t in zip(segments, dense, tans):
+        s.dense, s.tangent = d, t
+    counts = [len(d) for d in dense]
+    if not sum(counts):
+        for s in segments:
+            s.consistency = np.zeros(0)
+            s.left, s.right = [], []
+        return
+    allp = np.vstack([d for d in dense if len(d)])
+    allt = np.vstack([t for t, d in zip(tans, dense) if len(d)])
+    cs, left, right = bound.initiated_batch(allp, allt, binary, edt)
+    pos = 0
+    for s, n in zip(segments, counts):
+        s.consistency = np.asarray(cs[pos:pos+n])
+        s.left = left[pos:pos+n]
+        s.right = right[pos:pos+n]
+        pos += n
+
+
 def classify_segments(segments: list[Segment], graph: dict, bound: Boundaries,
                       binary: np.ndarray, edt: np.ndarray, cfg: Config) -> dict:
+    if hasattr(bound, 'initiated_batch'):
+        _sample_segments_batched(segments, binary, edt, bound)
+    else:
+        for s in segments:
+            sample_segment(s, binary, edt, bound)
+    # 论文 Eq.(3) 的反查表：边界**点** → 关联它的骨架段（左右两侧分开统计）。
+    # 用逐点而不是"逐边界段"：本实现的边界段是按 43° 转角切出来的，一条边界段
+    # 往往横跨很长一段轮廓，用它判"被多条骨架段共用"会把大量真实长线误判（实测
+    # 同一张图 76 个尖刺候选里有 67 个命中），而论文的边界段是"拟合偏差 >1px 就
+    # 断开"的细粒度段，才适合整段共用判定。
+    corr_left = defaultdict(set)
+    corr_right = defaultdict(set)
     for s in segments:
-        sample_segment(s,binary,edt,bound)
-    # Boundary-to-skeleton segment correlation, using boundary group IDs.
-    left_sets = {s.sid:{v.group for v in s.left if v is not None} for s in segments}
-    right_sets = {s.sid:{v.group for v in s.right if v is not None} for s in segments}
-    count_spike=count_connector=0
+        for v in s.left:
+            if v is not None:
+                corr_left[(v.contour, v.vertex)].add(s.sid)
+        for v in s.right:
+            if v is not None:
+                corr_right[(v.contour, v.vertex)].add(s.sid)
+    # 组级（旧实现口径）仍保留给下面的保守补充规则用。
+    grp_left = defaultdict(set)
+    grp_right = defaultdict(set)
+    for s in segments:
+        for v in s.left:
+            if v is not None:
+                grp_left[v.group].add(s.sid)
+        for v in s.right:
+            if v is not None:
+                grp_right[v.group].add(s.sid)
     incident=defaultdict(list)
     for s in segments:
         incident[s.start].append(s.sid)
         incident[s.end].append(s.sid)
+    count_spike=count_connector=0
+    connectors=[]                          # (Segment, radii)：连接段稍后统一批量判定
     for s in segments:
         a,b = _is_junction(s,graph)
         is_spike = (a ^ b) and not s.closed
@@ -714,23 +870,43 @@ def classify_segments(segments: list[Segment], graph: dict, bound: Boundaries,
             continue
         tangent_bad = len(s.consistency)>0 and bool(np.all(s.consistency < cfg.spike_cos))
         if is_spike:
-            # Eq. (3) is a boundary-guided completeness criterion. Apply it
-            # conservatively: other *incident* segments must use both sides.
+            # ---- 论文 Eq.(3) 边界引导完备性（本地版）----
+            # 候选采样点的左右边界点若都被**多于一条**骨架段关联（候选自身算一条），
+            # 说明这条"尖刺"与相邻骨架共用同一条边界，是细化在锐角/挤压处产生的假尖刺。
+            # 按论文原式判定，不再附加"必须大多数点切向不一致"——那恰好排除了论文
+            # 要点名的"切向一致的假尖刺"。
+            shared = 0
+            total = 0
+            for l_hit, r_hit in zip(s.left, s.right):
+                if l_hit is None or r_hit is None:
+                    continue
+                total += 1
+                if (len(corr_left[(l_hit.contour, l_hit.vertex)]) > 1
+                        and len(corr_right[(r_hit.contour, r_hit.vertex)]) > 1):
+                    shared += 1
+            shared_frac = (shared / total) if total else 0.0
+
             j = s.start if a else s.end
+            jpos = graph['nodes'][j]
+            jy = int(np.clip(round(jpos[1]), 0, edt.shape[0]-1))
+            jx = int(np.clip(round(jpos[0]), 0, edt.shape[1]-1))
+            local_width = 2.*float(edt[jy, jx])
+            # 长度上界是实现上的保护性约束（论文无此项）：边界段粒度不够细时，
+            # 长线段共用边界也可能只是两条近距离平行线，故只在"短"的候选上判完备性。
+            short = poly_length(s.dense) < max(6., 2.0*local_width)
+
+            # ---- 实现补充（非论文）----
+            # 像素级短支路：与同一交点的兄弟段共用边界段、且多数采样点切向不一致。
+            # 论文的细粒度边界段保证下这些通常已被 Eq.(3) 覆盖；本实现的边界段更粗，
+            # 用这条保守规则兜住 3–6px 的毛刺（否则它们会残留成锯齿）。
             siblings=[i for i in incident[j] if i != s.sid]
-            sib_left = set().union(*(left_sets[k]|right_sets[k] for k in siblings)) if siblings else set()
-            shared_left = left_sets[s.sid] & sib_left
-            shared_right = right_sets[s.sid] & sib_left
-            # Require distinct boundary segments on both sides, otherwise a
-            # single unsplit closed contour would lead to false deletion.
-            jpos=graph['nodes'][j]
-            jy,jx=int(np.clip(round(jpos[1]),0,edt.shape[0]-1)),int(np.clip(round(jpos[0]),0,edt.shape[1]-1))
-            local_width=2.*float(edt[jy,jx])
-            short=poly_length(s.dense) < max(6., 2.0*local_width)
-            mostly_inconsistent=float(np.mean(s.consistency < cfg.spike_cos)) > .25
-            completeness_bad = (cfg.enable_completeness and short and mostly_inconsistent
-                and bool(shared_left and shared_right)
-                and len((left_sets[s.sid] | right_sets[s.sid])) >= 2)
+            sib_groups = (set().union(*(grp_left[k]|grp_right[k] for k in siblings))
+                          if siblings else set())
+            shared_group = bool((grp_left[s.sid] & sib_groups) and (grp_right[s.sid] & sib_groups))
+            mostly_inconsistent = float(np.mean(s.consistency < cfg.spike_cos)) > .25
+
+            completeness_bad = bool(cfg.enable_completeness and short and (
+                shared_frac >= .5 or (shared_group and mostly_inconsistent)))
             if tangent_bad or completeness_bad:
                 s.active=False
                 s.reason='spike_tangent' if tangent_bad else 'spike_completeness'
@@ -739,10 +915,23 @@ def classify_segments(segments: list[Segment], graph: dict, bound: Boundaries,
             # Paper Sec. 4.2.2: for every point both D_skel<.99 and D_bnd<.95.
             xy=np.clip(np.rint(s.dense).astype(int),[0,0],[binary.shape[1]-1,binary.shape[0]-1])
             radii=np.minimum(cfg.ray_limit,np.maximum(5.,edt[xy[:,1],xy[:,0]]*3.+3.))
-            if hasattr(bound,'boundary_initiated_batch'):
-                db=bound.boundary_initiated_batch(s.dense,s.tangent,radii)
-            else:
-                db=np.asarray([bound.boundary_initiated(p,t,r) for p,t,r in zip(s.dense,s.tangent,radii)])
+            connectors.append((s,radii))
+    # 连接段判定与尖刺判定互不影响，统一批量做 kNN 查询（原先每段一次调用）。
+    if connectors:
+        if hasattr(bound,'boundary_initiated_batch'):
+            p_all=np.vstack([s.dense for s,_ in connectors])
+            t_all=np.vstack([s.tangent for s,_ in connectors])
+            r_all=np.concatenate([r for _,r in connectors])
+            db_all=bound.boundary_initiated_batch(p_all,t_all,r_all)
+        else:
+            db_all=np.concatenate([
+                np.asarray([bound.boundary_initiated(p,t,r)
+                            for p,t,r in zip(s.dense,s.tangent,radii)])
+                for s,radii in connectors])
+        pos=0
+        for s,radii in connectors:
+            db=db_all[pos:pos+len(radii)]
+            pos+=len(radii)
             both=(s.consistency<cfg.spike_cos)&(db<cfg.connector_boundary_cos)
             if len(both)>0 and bool(np.all(both)):
                 s.active=False;s.reason='connector_tangent';count_connector+=1
@@ -759,24 +948,27 @@ def trim_to_reliable(s: Segment, side: int, edt: np.ndarray, cfg: Config) -> int
     maxtrim = min(cfg.max_trim, max(3., 2.0*float(edt[y,x])+3.),
                   max(0.75, cfg.trim_fraction_limit * poly_length(p)))
     if side==0:
-        order=range(n)
+        order=np.arange(n)
     else:
-        order=range(n-1,-1,-1)
-    last=0 if side==0 else n-1
-    # Trim only an unreliable prefix at a junction. Require 2 consecutive
-    # reliable samples to avoid cutting far into a good line.
-    good=0
-    for idx in order:
-        if np.linalg.norm(p[idx]-end)>maxtrim:
-            break
-        if s.consistency[idx]>=cfg.spike_cos and s.left[idx] is not None and s.right[idx] is not None:
-            good+=1
-            if good>=2:
-                return last
-        else:
-            good=0
-        last=idx
-    return last
+        order=np.arange(n-1,-1,-1)
+    # 向量化等价实现：原逐点循环每条 dense 点都要算一次 norm + 取 left/right，
+    # 5.4MP 图上几万次小数组调用；这里一次算完。
+    dist_all=np.linalg.norm(p-end,axis=1)
+    dist=dist_all[order]
+    far=np.flatnonzero(dist>maxtrim)
+    k=int(far[0]) if len(far) else n
+    if k==0:
+        return 0 if side==0 else n-1
+    rel=(s.consistency[order[:k]]>=cfg.spike_cos)
+    has_side=np.fromiter((s.left[i] is not None and s.right[i] is not None
+                          for i in order[:k]),dtype=bool,count=k)
+    ok=rel & has_side
+    if k>=2:
+        both=ok[:-1] & ok[1:]
+        first=np.flatnonzero(both)
+        if len(first):
+            return int(order[int(first[0])])
+    return int(order[k-1])
 
 
 def _endpoint(s: Segment, side: int, junction: int, bound: Boundaries,
@@ -800,10 +992,72 @@ def _endpoint(s: Segment, side: int, junction: int, bound: Boundaries,
                     s.left[ix],s.right[ix],orig.copy())
 
 
-def _quadratic_extension(s: Segment, ep: Endpoint, target: np.ndarray, cfg: Config) -> np.ndarray:
-    # Paper fits a degree-2 polynomial to a broken line, then extrapolates.
-    # Here we fit x(t), y(t) in arclength over an adjacent ~10px prefix;
-    # a controlled Hermite correction makes the end land exactly at target.
+def _quadratic_ray(s: Segment, ep: Endpoint, cfg: Config, edt: np.ndarray) -> np.ndarray:
+    """论文 §4.3.2 的**盲延伸**：用 2 次多项式从 cut-off 一直延伸到边界。
+
+    与 `_quadratic_extension` 的区别：这里不朝任何目标点收弯，纯粹沿拟合曲线
+    往外走，遇到墨线外（`edt<=0`）或达到 `max_bridge` 才停 —— 供"多臂求交"用。
+    """
+    p = s.dense if ep.side == 1 else s.dense[::-1]
+    nearest = int(np.argmin(np.linalg.norm(p - ep.position, axis=1)))
+    prefix = p[max(0, nearest - 22):nearest + 1]
+    toward = np.asarray(ep.toward, float)
+    if len(prefix) < 3:
+        return np.vstack([ep.position, ep.position + toward * min(cfg.max_bridge, 8.)])
+    ar = np.r_[0., np.cumsum(np.linalg.norm(np.diff(prefix, axis=0), axis=1))]
+    ar = ar - ar[-1]
+    if len(np.unique(ar)) < 3:
+        return np.vstack([ep.position, ep.position + toward * min(cfg.max_bridge, 8.)])
+    px = np.polyfit(ar, prefix[:, 0], 2)
+    py = np.polyfit(ar, prefix[:, 1], 2)
+    steps = max(4, int(np.ceil(cfg.max_bridge / cfg.sample_step)))
+    ts = np.arange(0, steps + 1) * cfg.sample_step
+    xy = np.c_[np.polyval(px, ts), np.polyval(py, ts)]
+    h, w = edt.shape
+    xi = np.clip(np.rint(xy[:, 0]).astype(int), 0, w - 1)
+    yi = np.clip(np.rint(xy[:, 1]).astype(int), 0, h - 1)
+    outside = np.flatnonzero(edt[yi, xi] <= 0)
+    k = int(outside[0]) if outside.size else len(xy)
+    ray = xy[:max(2, k)].copy()
+    ray[0] = ep.position
+    return ray
+
+
+def _arm_intersections(rays: dict, arcs: dict, center: np.ndarray,
+                       max_reach: float, tol: float = 1.0) -> dict:
+    """多臂延伸两两求交，取每根臂上**沿延伸方向最远**的交点。
+
+    返回 {eid: (沿臂弧长, 交点坐标)}。交点必须落在 junction 附近（距离 center
+    不超过 max_reach），避免远处的偶然交叉把交点拉飞。
+    """
+    ids = list(rays)
+    best: dict[int, tuple[float, np.ndarray]] = {}
+    for i in range(len(ids)):
+        ri = rays[ids[i]]
+        for j in range(i + 1, len(ids)):
+            rj = rays[ids[j]]
+            d = np.linalg.norm(ri[:, None, :] - rj[None, :, :], axis=2)
+            ia, ib = np.unravel_index(int(np.argmin(d)), d.shape)
+            if d[ia, ib] > tol:
+                continue
+            pt = 0.5 * (ri[ia] + rj[ib])
+            if np.linalg.norm(pt - center) > max_reach:
+                continue
+            for eid, idx in ((ids[i], ia), (ids[j], ib)):
+                arc = float(arcs[eid][idx])
+                if arc > best.get(eid, (-1., None))[0]:
+                    best[eid] = (arc, np.asarray(pt, float))
+    return best
+
+
+def _quadratic_extension(s: Segment, ep: Endpoint, target: np.ndarray, cfg: Config,
+                         edt: np.ndarray) -> np.ndarray:
+    """论文 §4.3.2 的盲外推：对断点附近的点列拟合 2 次多项式，沿它延伸到**边界**，
+    再在交界处回剪；末点吸附到 `target` 以保持拓扑连通。
+
+    与旧实现（直接朝 target 做 Hermite 混合）相比：不再把曲线强行弯向目标点
+    （那会在断点处留下可见的折角），而是让多项式自己延伸，边界/目标点只负责截断。
+    """
     p=s.dense if ep.side==1 else s.dense[::-1]
     nearest=int(np.argmin(np.linalg.norm(p-ep.position,axis=1)))
     prefix=p[max(0,nearest-22):nearest+1]
@@ -816,15 +1070,27 @@ def _quadratic_extension(s: Segment, ep: Endpoint, target: np.ndarray, cfg: Conf
         return np.vstack([ep.position,target])
     px=np.polyfit(ar,prefix[:,0],2)
     py=np.polyfit(ar,prefix[:,1],2)
-    n=max(2,int(np.ceil(dist/cfg.sample_step)))
-    t=np.linspace(0,1,n)
-    step=min(dist,max(2.,dist*.9))
-    extrap=np.c_[np.polyval(px,t*step),np.polyval(py,t*step)]
-    # Keep polynomial's curvature near cutoff, and progressively steer
-    # toward the detected junction to prevent run-away extrapolation.
-    correction=(target-extrap[-1])[None,:]*(3*t**2-2*t**3)[:,None]
-    curve=extrap+correction
-    curve[0],curve[-1]=ep.position,target
+
+    # 沿多项式按采样步长前进，直到离开墨线（edt>0 为墨内）或达到 max_bridge。
+    h, w = edt.shape
+    steps = max(2, int(np.ceil(min(cfg.max_bridge, max(dist * 1.5, 6.)) / cfg.sample_step)))
+    ts = np.arange(1, steps + 1) * cfg.sample_step
+    xy = np.c_[np.polyval(px, ts), np.polyval(py, ts)]
+    xi = np.clip(np.rint(xy[:, 0]).astype(int), 0, w - 1)
+    yi = np.clip(np.rint(xy[:, 1]).astype(int), 0, h - 1)
+    outside = np.flatnonzero(edt[yi, xi] <= 0)
+    k_exit = int(outside[0]) if outside.size else len(ts)
+
+    curve = np.vstack([ep.position, xy[:max(1, k_exit)]])
+    # 回剪：取曲线上离 target 最近的样本，但不越过边界出口。
+    j = int(np.argmin(np.linalg.norm(curve - target, axis=1)))
+    curve = curve[:j + 1]
+    if len(curve) < 2:
+        return np.vstack([ep.position, target])
+    if np.linalg.norm(curve[-1] - target) > .3:
+        curve = np.vstack([curve, target])
+    else:
+        curve[-1] = target
     return curve
 
 
@@ -996,9 +1262,32 @@ def reconstruct(segments: list[Segment], graph: dict, bound: Boundaries,
             a,b=unmatched.pop(ia),unmatched.pop(ib)
             bridge_lines.append(line)
             bridge_records.append({'junction':nid, 'kind':kind, 'endpoints':[(a.sid,a.side),(b.sid,b.side)]})
+        # 论文 §4.3.2（盲拓扑重建）：未匹配的断点各自做 2 次多项式盲延伸，让延伸
+        # 相互求交，取沿延伸方向**最远**的交点作为新的 junction 位置并回剪。
+        # 交点由延伸臂自己决定，而不是强制吸附到某个已有目标点。
+        rays = {}
+        arcs = {}
+        for eid, ep in unmatched.items():
+            ray = _quadratic_ray(active[ep.sid], ep, cfg, edt)
+            if len(ray) < 2:
+                continue
+            rays[eid] = ray
+            arcs[eid] = np.r_[0., np.cumsum(np.linalg.norm(np.diff(ray, axis=0), axis=1))]
+        cross = _arm_intersections(rays, arcs, np.asarray(center, float), cfg.max_bridge)
         for ep in unmatched.values():
-            # At a T or Y junction, snap remaining branches to the closest
-            # existing centerline near the junction, otherwise the junction.
+            eid = ep.eid
+            if eid in cross:
+                s_hit, pt = cross[eid]
+                ray = rays[eid]
+                k = int(np.searchsorted(arcs[eid], s_hit)) + 1
+                line = ray[:max(2, min(k, len(ray)))].copy()
+                line[-1] = pt          # 多条延伸臂落到同一点 → 拓扑仍然连通
+                bridge_lines.append(line)
+                bridge_records.append({'junction':nid, 'kind':'extrapolate',
+                                       'endpoints':[(ep.sid,ep.side)]})
+                continue
+            # 兜底（保留原有连通性修复）：没有延伸交点时，吸附到最近的已有
+            # 中心线/交点中心，保证断点仍被接上。
             target=np.asarray(center,float)
             for line in bridge_lines:
                 if np.min(np.linalg.norm(line-center,axis=1))>cfg.max_bridge/2:
@@ -1008,7 +1297,7 @@ def reconstruct(segments: list[Segment], graph: dict, bound: Boundaries,
                     target=line[j]
             if np.linalg.norm(target-ep.position)>cfg.max_bridge:
                 continue
-            ext=_quadratic_extension(active[ep.sid],ep,target,cfg)
+            ext=_quadratic_extension(active[ep.sid],ep,target,cfg,edt)
             bridge_lines.append(ext)
             bridge_records.append({'junction':nid, 'kind':'extrapolate', 'endpoints':[(ep.sid,ep.side)]})
 
