@@ -13,3 +13,5 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+# 矢量化导出产物（demo.py / vectorize+export_result 可重新生成）
+outputs/
